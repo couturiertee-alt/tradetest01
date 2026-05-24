@@ -1,0 +1,9 @@
+typer[all]>=0.12.0
+rich>=13.7.0
+anthropic>=0.25.0
+pydantic>=2.0.0
+backtrader>=1.9.78.123
+ccxt>=4.2.0
+pandas>=2.0.0
+numpy>=1.24.0
+python-dotenv>=1.0.0

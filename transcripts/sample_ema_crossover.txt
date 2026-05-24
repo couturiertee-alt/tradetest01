@@ -1,0 +1,9 @@
+In this video I'll explain my EMA crossover strategy for Bitcoin on the 1-hour chart.
+
+I use a 20-period EMA and a 50-period EMA. When the fast EMA crosses above the slow EMA I go long. When the fast EMA crosses below the slow EMA I exit or go short.
+
+For risk management: stop loss is 2% below entry. Take profit target is 2:1 risk/reward ratio.
+I size my positions at 5% of total account equity per trade.
+
+This works best on BTC/USDT. I only trade in the direction of the daily trend.
+I also use RSI(14) to filter out overbought entries — I won't long if RSI is above 70.
