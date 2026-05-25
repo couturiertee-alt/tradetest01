@@ -5,30 +5,40 @@ arbitrage_sim.py  ─  USDT/USDC Cross-Pair Arbitrage Scanner & Simulator
 Strategy (from transcript)
 ──────────────────────────
 1. MARKET SCAN  : Find Bybit Spot assets listed in both X/USDT and X/USDC
-                  Mock CoinMarketCap volume gate (≥$5M 24h vol).
+                  Volume gate: ≥$5M 24h vol (live) or mock gate.
 2. SPREAD DETECT: Flag when Ask(USDT pair) − Bid(USDC pair) > 0
 3. DEPTH GATE   : Within ±2% of mid-price, Buy Depth > Sell Depth
 4. EXECUTION    : Convert USDT→USDC  →  BUY at USDC bid
                   Set SELL at +3% on USDT pair  →  track until fill or 1h timeout
 
 Run modes:
-    python arbitrage_sim.py           # normal (3s poll, realistic fill times)
-    python arbitrage_sim.py --fast    # fast-fills demo (for terminal testing)
+    python arbitrage_sim.py                    # mock order books, simulated fills
+    python arbitrage_sim.py --fast             # mock + accelerated fill times
+    python arbitrage_sim.py --live             # real Bybit order books, simulated fills
+    python arbitrage_sim.py --live --execute   # real order books + real order placement
+    python arbitrage_sim.py --live --sandbox   # real Bybit TESTNET (default when --live)
+    python arbitrage_sim.py --test N           # headless N-cycle test
+    python arbitrage_sim.py --no-screen        # disable Rich Live screen
 
-No API keys required — full mock/sandbox mode by default.
+Credentials (for --execute):
+    Set EXCHANGE_API_KEY and EXCHANGE_SECRET in .env
+    EXCHANGE_SANDBOX=false  to trade real funds (default: testnet)
 """
 from __future__ import annotations
 
 import asyncio
+import os
 import random
 import sys
 import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional
 
 import ccxt
+from dotenv import load_dotenv
 from rich import box
 from rich.console import Console
 from rich.layout import Layout
@@ -36,6 +46,9 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
+
+# Load .env so API keys are available
+load_dotenv(Path(__file__).parent / ".env")
 
 console = Console()
 
@@ -50,7 +63,10 @@ DEPTH_PCT         = 0.02      # ±2% depth window around mid-price
 SCAN_INTERVAL_S   = 3.0       # seconds between scan cycles
 UPDATE_TICK_S     = 0.5       # how often to poll trade fills / refresh UI
 MAX_LOG           = 26        # lines visible in event log
-FAST              = "--fast" in sys.argv
+FAST              = "--fast"    in sys.argv
+LIVE              = "--live"    in sys.argv
+EXECUTE           = "--execute" in sys.argv and LIVE
+SANDBOX           = "--sandbox" in sys.argv or os.getenv("EXCHANGE_SANDBOX", "true").lower() != "false"
 
 # Simulated fill delays (real-clock seconds)
 BUY_FILL_S  = (1.5, 4.0)  if FAST else (3.0,  9.0)
@@ -115,16 +131,17 @@ class DepthResult:
 
 @dataclass
 class SimOrder:
-    oid:     str
-    pair:    str
-    side:    str          # "BUY" | "SELL"
-    qty:     float
-    price:   float
-    status:  str          # "OPEN" | "FILLED" | "TIMEOUT"
-    created: datetime
-    fill_at: datetime     # wall-clock time this order simulates as filled
-    expires: Optional[datetime] = None
-    filled:  Optional[datetime] = None
+    oid:      str
+    pair:     str
+    side:     str          # "BUY" | "SELL"
+    qty:      float
+    price:    float
+    status:   str          # "OPEN" | "FILLED" | "TIMEOUT"
+    created:  datetime
+    fill_at:  datetime     # wall-clock time this order simulates as filled (mock) or sentinel (live)
+    expires:  Optional[datetime] = None
+    filled:   Optional[datetime] = None
+    real_oid: Optional[str]      = None   # real exchange order ID when --execute
 
 
 @dataclass
@@ -214,6 +231,115 @@ class MockBybit:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Live Exchange — Real Bybit Order Books (public, no auth needed)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class LiveBybit:
+    """
+    Fetches real order books from Bybit via CCXT public endpoints.
+    No API key required. Drop-in replacement for MockBybit.
+
+    At startup, discovers all assets listed in both X/USDT and X/USDC
+    on Bybit Spot, filtered by ≥$1M 24h volume.
+    """
+
+    MIN_VOL_USD = 1_000_000.0   # 24h volume gate
+
+    def __init__(self, *, sandbox: bool = True) -> None:
+        self._ex = ccxt.bybit({
+            "options":         {"defaultType": "spot"},
+            "enableRateLimit": True,
+            "sandbox":         sandbox,
+        })
+        console.print("[dim]Loading Bybit markets…[/]", end=" ")
+        self._ex.load_markets()
+        self._universe = self._discover()
+        console.print(f"[green]OK[/]  — {len(self._universe)} dual-quote pairs")
+
+    def _discover(self) -> list[tuple[str, float]]:
+        """Return (base, mid_price) for every asset with both USDT and USDC spot markets."""
+        pairs: list[tuple[str, float]] = []
+        for sym, mkt in self._ex.markets.items():
+            if not sym.endswith("/USDT"):
+                continue
+            base    = sym.split("/")[0]
+            usdc_sym = f"{base}/USDC"
+            if usdc_sym not in self._ex.markets:
+                continue
+            # Volume gate from market info (may be 0 if exchange doesn't supply it)
+            vol = float(mkt.get("info", {}).get("volume24h", 0) or 0)
+            mid = float(mkt.get("info", {}).get("lastPrice", 1) or 1)
+            if vol >= self.MIN_VOL_USD or vol == 0:   # 0 means data not available, allow
+                pairs.append((base, mid))
+        # Fall back to UNIVERSE bases if discovery returns nothing useful
+        if not pairs:
+            pairs = UNIVERSE
+        return pairs[:25]
+
+    @property
+    def universe(self) -> list[tuple[str, float]]:
+        return self._universe
+
+    def fetch_books(self, sym: str, *, trigger: bool = False) -> tuple[OBook, OBook]:
+        """Fetch live order books; trigger flag is ignored (real markets)."""
+        def _parse(raw: dict, symbol: str) -> OBook:
+            bids = [Level(price=float(b[0]), vol=float(b[1])) for b in raw["bids"][:40]]
+            asks = [Level(price=float(a[0]), vol=float(a[1])) for a in raw["asks"][:40]]
+            return OBook(symbol=symbol, bids=bids, asks=asks)
+
+        usdt_raw = self._ex.fetch_order_book(f"{sym}/USDT", limit=40)
+        usdc_raw = self._ex.fetch_order_book(f"{sym}/USDC", limit=40)
+        return _parse(usdt_raw, f"{sym}/USDT"), _parse(usdc_raw, f"{sym}/USDC")
+
+    def advance_cycle(self, cycle: int) -> Optional[str]:
+        return None   # no forced triggers; real markets generate their own signals
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Live Executor — Real Order Placement (needs API key, --execute flag)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class LiveBybitExecutor:
+    """
+    Places, monitors, and cancels real Bybit spot orders via CCXT.
+    Requires EXCHANGE_API_KEY and EXCHANGE_SECRET in .env.
+    Uses testnet by default (EXCHANGE_SANDBOX=false to disable).
+    """
+
+    def __init__(self, *, sandbox: bool = True) -> None:
+        api_key = os.getenv("EXCHANGE_API_KEY", "")
+        secret  = os.getenv("EXCHANGE_SECRET",  "")
+        if not api_key or not secret:
+            raise EnvironmentError(
+                "EXCHANGE_API_KEY and EXCHANGE_SECRET must be set in .env to use --execute"
+            )
+        self._ex = ccxt.bybit({
+            "apiKey":          api_key,
+            "secret":          secret,
+            "options":         {"defaultType": "spot"},
+            "enableRateLimit": True,
+            "sandbox":         sandbox,
+        })
+        self._ex.load_markets()
+
+    def place_limit(self, symbol: str, side: str, qty: float, price: float) -> str:
+        """Place a limit order. Returns the exchange order ID."""
+        fn = self._ex.create_limit_buy_order if side == "BUY" else self._ex.create_limit_sell_order
+        order = fn(symbol, qty, price)
+        return str(order["id"])
+
+    def cancel(self, order_id: str, symbol: str) -> None:
+        try:
+            self._ex.cancel_order(order_id, symbol)
+        except Exception:
+            pass   # already filled or expired
+
+    def check(self, order_id: str, symbol: str) -> dict:
+        """Return the ccxt order dict; status: 'open' | 'closed' | 'canceled'."""
+        return self._ex.fetch_order(order_id, symbol)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Depth Analysis
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -238,8 +364,14 @@ def analyze_depth(book: OBook) -> DepthResult:
 
 class Engine:
 
-    def __init__(self) -> None:
-        self.ex     = MockBybit()
+    def __init__(
+        self,
+        exchange: Optional[object] = None,   # MockBybit | LiveBybit
+        executor: Optional[object] = None,   # None | LiveBybitExecutor
+    ) -> None:
+        self.ex       = exchange or MockBybit()
+        self.executor = executor
+        self.universe: list[tuple[str, float]] = getattr(self.ex, "universe", UNIVERSE)
         self.cycle  = 0
         self.start  = datetime.utcnow()
         self.active: list[SimTrade] = []
@@ -264,16 +396,20 @@ class Engine:
         self.cycle += 1
         self.stats["scans"] += 1
         trigger_sym = self.ex.advance_cycle(self.cycle)
-        self._log("CYCLE", f"Scan #{self.cycle} — polling {len(UNIVERSE)} pairs")
+        self._log("CYCLE", f"Scan #{self.cycle} — polling {len(self.universe)} pairs")
 
         entered = False
-        for sym, _ in UNIVERSE:
+        for sym, _ in self.universe:
             # Skip assets already in an active trade
             if any(t.asset == sym and t.phase != "DONE" for t in self.active):
                 continue
 
-            is_trig            = (sym == trigger_sym and not entered)
-            usdt_book, usdc_book = self.ex.fetch_books(sym, trigger=is_trig)
+            is_trig = (sym == trigger_sym and not entered)
+            try:
+                usdt_book, usdc_book = self.ex.fetch_books(sym, trigger=is_trig)
+            except Exception as exc:
+                self._log("CYCLE", f"[dim]  {sym}: fetch error — {exc}[/]")
+                continue
 
             # ── Step 1: Spread Detection ──────────────────────────────────
             spread = usdt_book.best_ask - usdc_book.best_bid
@@ -310,27 +446,40 @@ class Engine:
     async def _enter(self, sym: str, usdc_bid: float) -> None:
         now   = datetime.utcnow()
         qty   = round(ALLOCATION_USDT / usdc_bid, 4)
-        delay = random.uniform(*BUY_FILL_S)
 
-        # (a) Mock USDT → USDC conversion
         self._log("EXEC",
-            f"  Converting [yellow]{ALLOCATION_USDT:,.0f} USDT[/] → USDC (1:1 sim)")
+            f"  {'Placing real' if self.executor else 'Converting'}"
+            f" [yellow]{ALLOCATION_USDT:,.0f} USDT[/] → USDC"
+            f"  ({'live order' if self.executor else '1:1 sim'})")
 
-        # (b) BUY LIMIT on USDC pair
+        real_oid: Optional[str] = None
+        if self.executor:
+            try:
+                real_oid = self.executor.place_limit(f"{sym}/USDC", "BUY", qty, usdc_bid)
+            except Exception as exc:
+                self._log("EXEC", f"  [red]Order placement failed:[/] {exc}")
+                return
+            delay    = 0.0   # poll real status instead of simulated fill time
+            fill_at  = now + timedelta(hours=24)   # sentinel; real status checked first
+        else:
+            delay   = random.uniform(*BUY_FILL_S)
+            fill_at = now + timedelta(seconds=delay)
+
         buy = SimOrder(
-            oid     = uuid.uuid4().hex[:8],
-            pair    = f"{sym}/USDC",
-            side    = "BUY",
-            qty     = qty,
-            price   = usdc_bid,
-            status  = "OPEN",
-            created = now,
-            fill_at = now + timedelta(seconds=delay),
+            oid      = real_oid or uuid.uuid4().hex[:8],
+            pair     = f"{sym}/USDC",
+            side     = "BUY",
+            qty      = qty,
+            price    = usdc_bid,
+            status   = "OPEN",
+            created  = now,
+            fill_at  = fill_at,
+            real_oid = real_oid,
         )
+        fill_hint = f"  (order {real_oid})" if real_oid else f"  (~{delay:.0f}s fill)"
         self._log("ORDER",
             f"  [cyan]► BUY LIMIT[/]  {sym}/USDC"
-            f"  {qty:,.4f} @ {usdc_bid:.6f} USDC"
-            f"  (~{delay:.0f}s fill)")
+            f"  {qty:,.4f} @ {usdc_bid:.6f} USDC{fill_hint}")
 
         trade = SimTrade(
             tid   = uuid.uuid4().hex[:6].upper(),
@@ -344,30 +493,73 @@ class Engine:
 
     # ── Trade Lifecycle Updates ───────────────────────────────────────────────
 
+    def _buy_is_filled(self, t: "SimTrade", now: datetime) -> bool:
+        """True when the buy order should be treated as filled."""
+        if self.executor and t.buy.real_oid:
+            try:
+                info = self.executor.check(t.buy.real_oid, t.buy.pair)
+                if info.get("status") == "closed":
+                    # Use actual fill price if available
+                    t.buy.price = float(info.get("average") or t.buy.price)
+                    return True
+                return False
+            except Exception:
+                return False
+        return now >= t.buy.fill_at
+
+    def _sell_is_filled(self, t: "SimTrade", now: datetime) -> bool:
+        """True when the sell order should be treated as filled."""
+        sl = t.sell
+        if sl is None:
+            return False
+        if self.executor and sl.real_oid:
+            try:
+                info = self.executor.check(sl.real_oid, sl.pair)
+                if info.get("status") == "closed":
+                    sl.price = float(info.get("average") or sl.price)
+                    return True
+                return False
+            except Exception:
+                return False
+        return now >= sl.fill_at
+
     async def update(self) -> None:
         now  = datetime.utcnow()
         done = []
 
         for t in self.active:
             if t.phase == "BUYING":
-                if now >= t.buy.fill_at:
+                if self._buy_is_filled(t, now):
                     t.buy.status = "FILLED"
                     t.buy.filled = now
                     t.phase      = "HOLDING"
 
                     # (c) Calculate sell price at +3%
-                    sell_px     = round(t.buy.price * (1.0 + PROFIT_TARGET_PCT), 6)
-                    sell_delay  = random.uniform(*SELL_FILL_S)
-                    sell        = SimOrder(
-                        oid     = uuid.uuid4().hex[:8],
-                        pair    = f"{t.asset}/USDT",
-                        side    = "SELL",
-                        qty     = t.buy.qty,
-                        price   = sell_px,
-                        status  = "OPEN",
-                        created = now,
-                        fill_at = now + timedelta(seconds=sell_delay),
-                        expires = now + timedelta(hours=TIMEOUT_HOURS),
+                    sell_px = round(t.buy.price * (1.0 + PROFIT_TARGET_PCT), 6)
+                    expires = now + timedelta(hours=TIMEOUT_HOURS)
+
+                    real_sell_oid: Optional[str] = None
+                    if self.executor:
+                        try:
+                            real_sell_oid = self.executor.place_limit(
+                                f"{t.asset}/USDT", "SELL", t.buy.qty, sell_px
+                            )
+                        except Exception as exc:
+                            self._log("EXEC", f"  [red]SELL order failed:[/] {exc}")
+
+                    sell_delay = 0.0 if self.executor else random.uniform(*SELL_FILL_S)
+                    sell = SimOrder(
+                        oid      = real_sell_oid or uuid.uuid4().hex[:8],
+                        pair     = f"{t.asset}/USDT",
+                        side     = "SELL",
+                        qty      = t.buy.qty,
+                        price    = sell_px,
+                        status   = "OPEN",
+                        created  = now,
+                        fill_at  = now + timedelta(seconds=sell_delay) if not self.executor
+                                   else now + timedelta(hours=24),
+                        expires  = expires,
+                        real_oid = real_sell_oid,
                     )
                     t.sell = sell
 
@@ -375,17 +567,20 @@ class Engine:
                         f"  [green]✓ BUY FILLED[/]  [[bold]{t.tid}[/]]"
                         f"  {t.buy.pair}  {t.buy.qty:,.4f} @ {t.buy.price:.6f}")
 
-                    # (d) SELL LIMIT on USDT pair at +3%
+                    hint = f"  (order {real_sell_oid})" if real_sell_oid else \
+                           f"  (~{sell_delay:.0f}s fill)"
                     self._log("ORDER",
                         f"  [yellow]► SELL LIMIT[/]  {t.asset}/USDT"
                         f"  {sell.qty:,.4f} @ {sell_px:.6f}"
                         f"  ([green]+{PROFIT_TARGET_PCT*100:.0f}%[/])"
-                        f"  exp {TIMEOUT_HOURS:.0f}h")
+                        f"  exp {TIMEOUT_HOURS:.0f}h{hint}")
 
             elif t.phase == "HOLDING" and t.sell is not None:
                 sl = t.sell
                 # Timeout check
                 if sl.expires and now >= sl.expires:
+                    if self.executor and sl.real_oid:
+                        self.executor.cancel(sl.real_oid, sl.pair)
                     sl.status       = "TIMEOUT"
                     t.phase         = "DONE"
                     t.pnl           = 0.0
@@ -396,8 +591,8 @@ class Engine:
                         f"  — order expired after {TIMEOUT_HOURS:.0f}h")
                     done.append(t)
 
-                # Simulated fill check
-                elif now >= sl.fill_at:
+                # Fill check (simulated timestamp OR real exchange poll)
+                elif self._sell_is_filled(t, now):
                     sl.status  = "FILLED"
                     sl.filled  = now
                     t.phase    = "DONE"
@@ -449,15 +644,22 @@ def render(eng: Engine) -> Layout:
     wr      = f"{st['wins']/st['trades']*100:.0f}%" if st["trades"] else "—"
 
     # ── Header bar ───────────────────────────────────────────────────────────
+    if EXECUTE:
+        mode_str = "[bold red]LIVE + EXECUTE[/]"
+    elif LIVE:
+        mode_str = f"[bold green]LIVE{'  TESTNET' if SANDBOX else '  MAINNET'}[/]"
+    else:
+        mode_str = f"[yellow]MOCK{'  FAST' if FAST else ''}[/]"
+
     header_markup = (
         f"[bold cyan]◈  USDT/USDC CROSS-PAIR ARB SCANNER[/]"
-        f"  [dim]│[/]  [white]Bybit Spot (Mock)[/]"
+        f"  [dim]│[/]  Bybit Spot"
         f"  [dim]│[/]  Cycle [cyan]#{eng.cycle}[/]"
         f"  [dim]│[/]  Runtime [cyan]{_runtime(eng.start)}[/]"
         f"  [dim]│[/]  Trades [cyan]{st['trades']}[/]"
         f"  [dim]│[/]  Win Rate [cyan]{wr}[/]"
         f"  [dim]│[/]  PnL [{pnl_col}]{st['pnl']:+,.2f} USDT[/{pnl_col}]"
-        f"  [dim]│[/]  Mode [yellow]{'FAST' if FAST else 'NORMAL'}[/]"
+        f"  [dim]│[/]  {mode_str}"
     )
     header_panel = Panel(
         Text.from_markup(header_markup),
@@ -597,23 +799,27 @@ def render(eng: Engine) -> Layout:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CCXT Bootstrap (optional real connectivity check)
+# Exchange / executor factory
 # ─────────────────────────────────────────────────────────────────────────────
 
-def probe_bybit_testnet() -> str:
-    """
-    Non-blocking probe of Bybit testnet public endpoints.
-    Returns a status string. Engine uses MockBybit regardless.
-    Swap MockBybit for ccxt.bybit to use live testnet order books.
-    """
+def build_exchange() -> tuple[object, Optional[object]]:
+    """Return (exchange, executor) based on CLI flags."""
+    if not LIVE:
+        return MockBybit(), None
+
+    exchange = LiveBybit(sandbox=SANDBOX)
+
+    if not EXECUTE:
+        return exchange, None
+
     try:
-        ex = ccxt.bybit({"options": {"defaultType": "spot"}, "sandbox": True})
-        ex.load_markets()
-        dual = [(s, ex.markets[s]) for s in ex.markets
-                if s.endswith("/USDT") and s.replace("USDT", "USDC") in ex.markets]
-        return f"[green]Bybit testnet reachable[/] — {len(dual)} dual-quote pairs found"
-    except Exception as e:
-        return f"[yellow]Bybit testnet offline ({type(e).__name__}) — using mock data[/]"
+        executor = LiveBybitExecutor(sandbox=SANDBOX)
+        console.print("[green]Executor ready[/] — real orders will be placed on Bybit"
+                      + (" [yellow](TESTNET)[/]" if SANDBOX else " [bold red](MAINNET — REAL FUNDS)[/]"))
+        return exchange, executor
+    except EnvironmentError as exc:
+        console.print(f"[red]Cannot enable --execute:[/] {exc}")
+        raise SystemExit(1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -621,29 +827,38 @@ def probe_bybit_testnet() -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def run() -> None:
-    # Splash
+    # ── Build exchange / executor ─────────────────────────────────────────────
+    exchange, executor = build_exchange()
+    n_pairs = len(getattr(exchange, "universe", UNIVERSE))
+
+    if EXECUTE:
+        mode_label = "LIVE + EXECUTE  (" + ("TESTNET" if SANDBOX else "MAINNET — REAL FUNDS") + ")"
+        mode_color = "red"
+    elif LIVE:
+        mode_label = "LIVE  (" + ("TESTNET" if SANDBOX else "MAINNET") + ")"
+        mode_color = "green"
+    else:
+        mode_label = "MOCK" + ("  FAST" if FAST else "")
+        mode_color = "yellow"
+
     console.print(Panel(
         f"  [bold cyan]USDT/USDC Cross-Pair Arbitrage Simulator[/bold cyan]\n\n"
-        f"  [dim]Exchange  :[/dim] Bybit Spot (Sandbox / Mock)\n"
-        f"  [dim]Pairs     :[/dim] {len(UNIVERSE)} candidates (dual USDT+USDC)\n"
+        f"  [dim]Exchange  :[/dim] Bybit Spot\n"
+        f"  [dim]Pairs     :[/dim] {n_pairs} candidates (dual USDT+USDC)\n"
         f"  [dim]Allocation:[/dim] [yellow]{ALLOCATION_USDT:,.0f} USDT[/] per trade\n"
         f"  [dim]Target    :[/dim] [green]+{PROFIT_TARGET_PCT*100:.0f}%[/] sell above entry\n"
         f"  [dim]Depth gate:[/dim] ±{DEPTH_PCT*100:.0f}% buy/sell imbalance\n"
         f"  [dim]Timeout   :[/dim] {TIMEOUT_HOURS:.0f}h per open sell order\n"
-        f"  [dim]Mode      :[/dim] [yellow]{'FAST (accelerated fills)' if FAST else 'NORMAL'}[/]\n\n"
+        f"  [dim]Mode      :[/dim] [{mode_color}]{mode_label}[/{mode_color}]\n\n"
         f"  [dim]Ctrl+C to stop[/dim]",
         title="[bold cyan]▶  Starting[/bold cyan]",
         border_style="cyan",
     ))
-
-    console.print(f"  [dim]Probing Bybit testnet…[/dim]", end=" ")
-    status = probe_bybit_testnet()
-    console.print(Text.from_markup(status))
     console.print()
-    await asyncio.sleep(1.5)
+    await asyncio.sleep(0.5 if LIVE else 1.5)
 
-    eng          = Engine()
-    last_scan    = 0.0
+    eng       = Engine(exchange=exchange, executor=executor)
+    last_scan = 0.0
 
     try:
         use_screen = sys.stdout.isatty() and "--no-screen" not in sys.argv
@@ -699,14 +914,15 @@ _LEVEL_ICONS = {
 
 async def run_test(cycles: int = 30) -> None:
     """Headless test: run `cycles` scan cycles, printing each event live."""
+    exchange, executor = build_exchange() if LIVE else (None, None)
     console.print(Panel(
         f"[bold cyan]USDT/USDC Arb Simulator — HEADLESS TEST MODE[/bold cyan]\n"
-        f"[dim]Running {cycles} scan cycles with fast fills. No Live dashboard.[/dim]",
+        f"[dim]Running {cycles} scan cycles. No Live dashboard.[/dim]\n"
+        f"[dim]Mode: {'LIVE' if LIVE else 'MOCK'}{'  EXECUTE' if EXECUTE else ''}[/dim]",
         border_style="cyan",
     ))
-    console.print(f"[dim]Exchange probe:[/dim] {probe_bybit_testnet()}\n")
 
-    eng    = Engine()
+    eng    = Engine(exchange=exchange, executor=executor)
     seen   = 0  # log lines already printed
 
     def flush_log() -> None:
